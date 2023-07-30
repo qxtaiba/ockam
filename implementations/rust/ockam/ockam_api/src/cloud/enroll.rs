@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "tag")]
 use ockam_core::TypeTag;
 
-#[derive(Encode, Decode, Serialize, Deserialize, Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq, Clone))]
+#[derive(Encode, Decode, Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[cbor(transparent)]
 #[serde(transparent)]
 pub struct Token(#[n(0)] pub String);
@@ -24,29 +24,40 @@ mod node {
     use minicbor::Decoder;
     use tracing::trace;
 
+    use ockam::identity::credential::Attributes;
     use ockam_core::api::Request;
     use ockam_core::{self, Result};
+    use ockam_multiaddr::MultiAddr;
     use ockam_node::Context;
 
-    use crate::cloud::enroll::auth0::AuthenticateAuth0Token;
+    use crate::cloud::enroll::auth0::{AuthenticateOidcToken, OidcToken};
     use crate::cloud::enroll::enrollment_token::{EnrollmentToken, RequestEnrollmentToken};
     use crate::cloud::{CloudRequestWrapper, ORCHESTRATOR_RESTART_TIMEOUT};
-    use crate::nodes::NodeManagerWorker;
-    use ockam::identity::credential::Attributes;
+    use crate::nodes::{NodeManager, NodeManagerWorker};
 
     const TARGET: &str = "ockam_api::cloud::enroll";
 
-    impl NodeManagerWorker {
+    impl NodeManager {
         /// Executes an enrollment process to generate a new set of access tokens using the auth0 flow.
-        pub(crate) async fn enroll_auth0(
-            &mut self,
-            ctx: &mut Context,
-            dec: &mut Decoder<'_>,
+        pub async fn enroll_auth0(
+            &self,
+            ctx: &Context,
+            route: &MultiAddr,
+            token: OidcToken,
+        ) -> Result<()> {
+            let request = CloudRequestWrapper::new(AuthenticateOidcToken::new(token), route, None);
+            self.enroll_auth0_response(ctx, request).await?;
+            Ok(())
+        }
+
+        /// Executes an enrollment process to generate a new set of access tokens using the auth0 flow.
+        pub(crate) async fn enroll_auth0_response(
+            &self,
+            ctx: &Context,
+            req_wrapper: CloudRequestWrapper<AuthenticateOidcToken>,
         ) -> Result<Vec<u8>> {
-            let req_wrapper: CloudRequestWrapper<AuthenticateAuth0Token> = dec.decode()?;
-            let cloud_multiaddr = req_wrapper.multiaddr()?;
-            let req_body: AuthenticateAuth0Token = req_wrapper.req;
-            let req_builder = Request::post("v0/enroll").body(req_body);
+            let route = req_wrapper.multiaddr()?;
+            let req_builder = Request::post("v0/enroll").body(req_wrapper.req);
             let api_service = "auth0_authenticator";
 
             trace!(target: TARGET, "executing auth0 flow");
@@ -55,13 +66,25 @@ mod node {
                 ctx,
                 api_service,
                 None,
-                &cloud_multiaddr,
+                &route,
                 api_service,
                 req_builder,
                 None,
                 Duration::from_secs(ORCHESTRATOR_RESTART_TIMEOUT),
             )
             .await
+        }
+    }
+
+    impl NodeManagerWorker {
+        /// Executes an enrollment process to generate a new set of access tokens using the auth0 flow.
+        pub async fn enroll_auth0_response(
+            &self,
+            ctx: &Context,
+            req_wrapper: CloudRequestWrapper<AuthenticateOidcToken>,
+        ) -> Result<Vec<u8>> {
+            let node_manager = self.get().read().await;
+            node_manager.enroll_auth0_response(ctx, req_wrapper).await
         }
 
         /// Generates a token that will be associated to the passed attributes.
@@ -152,15 +175,15 @@ pub mod auth0 {
         pub error_description: Cow<'a, str>,
     }
 
-    #[derive(serde::Deserialize, Debug)]
-    #[cfg_attr(test, derive(PartialEq, Eq, Clone))]
-    pub struct Auth0Token {
+    #[derive(serde::Deserialize, Debug, Clone)]
+    #[cfg_attr(test, derive(PartialEq, Eq))]
+    pub struct OidcToken {
         pub token_type: TokenType,
         pub access_token: Token,
     }
 
-    #[derive(serde::Deserialize, Debug)]
-    #[cfg_attr(test, derive(PartialEq, Eq, Clone))]
+    #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+    #[cfg_attr(test, derive(PartialEq, Eq))]
     pub struct UserInfo {
         pub sub: String,
         pub nickname: String,
@@ -175,15 +198,15 @@ pub mod auth0 {
     #[cfg_attr(test, derive(Clone))]
     #[rustfmt::skip]
     #[cbor(map)]
-    pub struct AuthenticateAuth0Token {
+    pub struct AuthenticateOidcToken {
         #[cfg(feature = "tag")]
         #[n(0)] pub tag: TypeTag<1058055>,
         #[n(1)] pub token_type: TokenType,
         #[n(2)] pub access_token: Token,
     }
 
-    impl AuthenticateAuth0Token {
-        pub fn new(token: Auth0Token) -> Self {
+    impl AuthenticateOidcToken {
+        pub fn new(token: OidcToken) -> Self {
             Self {
                 #[cfg(feature = "tag")]
                 tag: TypeTag,
@@ -195,8 +218,8 @@ pub mod auth0 {
 
     // Auxiliary types
 
-    #[derive(serde::Deserialize, Encode, Decode, Debug)]
-    #[cfg_attr(test, derive(PartialEq, Eq, Clone))]
+    #[derive(serde::Deserialize, Encode, Decode, Debug, Clone)]
+    #[cfg_attr(test, derive(PartialEq, Eq))]
     #[rustfmt::skip]
     #[cbor(index_only)]
     pub enum TokenType {
@@ -205,8 +228,9 @@ pub mod auth0 {
 }
 
 pub mod enrollment_token {
-    use ockam::identity::credential::Attributes;
     use serde::Serialize;
+
+    use ockam::identity::credential::Attributes;
 
     use super::*;
 

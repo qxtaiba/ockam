@@ -1,16 +1,19 @@
-use miette::IntoDiagnostic;
+use miette::{miette, IntoDiagnostic};
+
 use tauri::{AppHandle, Manager, State, Wry};
 use tracing::log::{error, info};
 
-use ockam::Context;
+use ockam::identity::IdentityIdentifier;
+use ockam_api::cli_state;
 use ockam_api::cli_state::traits::StateDirTrait;
-use ockam_api::cli_state::CliState;
-use ockam_command::enroll::{enroll, Auth0Service};
-use ockam_command::CommandGlobalOpts;
-use ockam_core::AsyncTryClone;
+use ockam_api::cli_state::SpaceConfig;
+use ockam_api::cloud::project::Project;
+use ockam_api::cloud::space::{CreateSpace, Space};
+use ockam_command::enroll::{update_enrolled_identity, OidcService};
+use ockam_command::util::api::CloudOpts;
 
-use crate::app;
-use crate::app::AppState;
+use crate::app::{AppState, NODE_NAME, PROJECT_NAME};
+use crate::shared_service::relay::create::create_relay;
 use crate::Result;
 
 /// Enroll a user.
@@ -21,54 +24,109 @@ use crate::Result;
 ///  - connects to the Orchestrator with the retrieved token to create a project
 pub async fn enroll_user(app: &AppHandle<Wry>) -> Result<()> {
     let app_state: State<AppState> = app.state::<AppState>();
-    if app_state.state().identities.default().is_err() {
-        info!("creating a default identity");
-        create_default_identity(app_state.state())
-            .await
-            .map_err(|e| {
-                error!("{:?}", e);
-                e
-            })?;
-    };
-
-    let context = app_state.context().async_try_clone().await.unwrap();
-    enroll_with_token(&context, app_state.options())
+    enroll_with_token(&app_state)
         .await
+        .map(|i| info!("Enrolled a new user with identifier {}", i))
         .unwrap_or_else(|e| error!("{:?}", e));
-    app.trigger_global(app::events::SYSTEM_TRAY_ON_UPDATE, None);
+    create_relay(&app_state).await?;
+    app.trigger_global(crate::app::events::SYSTEM_TRAY_ON_UPDATE, None);
     Ok(())
 }
 
-async fn enroll_with_token(ctx: &Context, options: CommandGlobalOpts) -> Result<()> {
+async fn enroll_with_token(app_state: &AppState) -> Result<IdentityIdentifier> {
     // get an Auth0 token
-    let token = Auth0Service::default().get_token_with_pkce().await?;
+    let auth0_service = OidcService::default();
+    let token = auth0_service.get_token_with_pkce().await?;
+
+    // retrieve the user information
+    let user_info = auth0_service.get_user_info(token.clone()).await?;
+    info!("the user info is {user_info:?}");
+    app_state.model_mut(|m| m.set_user_info(user_info)).await?;
+
     // enroll the current user using that token on the controller
-    enroll(ctx, &options, token).await?;
-    Ok(())
-}
-
-async fn create_default_identity(state: CliState) -> Result<()> {
-    let vault_state = match state.vaults.default() {
-        Err(_) => {
-            info!("creating a default vault");
-            state.create_vault_state(None).await?
-        }
-        Ok(vault_state) => vault_state,
-    };
-    info!("retrieved the vault state");
-
-    let identity = state
-        .get_identities(vault_state.get().await?)
-        .await?
-        .identities_creation()
-        .create_identity()
+    let node_manager = app_state.node_manager.get().write().await;
+    node_manager
+        .enroll_auth0(&app_state.context(), &CloudOpts::route(), token)
         .await
         .into_diagnostic()?;
-    info!("created a new identity {}", identity.identifier());
 
-    let _ = state
-        .create_identity_state(&identity.identifier(), None)
-        .await?;
-    info!("created a new identity state");
-    Ok(())
+    let space = retrieve_space(app_state).await?;
+    let _ = retrieve_project(app_state, &space).await?;
+    let identifier = update_enrolled_identity(&app_state.options().await, NODE_NAME)
+        .await
+        .into_diagnostic()?;
+    Ok(identifier)
+}
+
+async fn retrieve_space(app_state: &AppState) -> Result<Space> {
+    info!("retrieving the user space");
+    let node_manager = app_state.node_manager.get().read().await;
+
+    // list the spaces that the user can access
+    // and sort them by name to make sure to get the same space every time
+    // if several spaces are available
+    let spaces = {
+        let mut spaces = node_manager
+            .list_spaces(&app_state.context(), &CloudOpts::route())
+            .await
+            .map_err(|e| miette!(e))?;
+        spaces.sort_by(|s1, s2| s1.name.cmp(&s2.name));
+        spaces
+    };
+
+    // take the first one that is available
+    // otherwise create a space with a random name
+    let space = match spaces.first() {
+        Some(space) => space.clone(),
+        None => {
+            let space_name = cli_state::random_name();
+            node_manager
+                .create_space(
+                    &app_state.context(),
+                    CreateSpace::new(space_name, vec![]),
+                    &CloudOpts::route(),
+                    None,
+                )
+                .await
+                .map_err(|e| miette!(e))?
+        }
+    };
+    app_state
+        .state()
+        .await
+        .spaces
+        .overwrite(&space.name, SpaceConfig::from(&space))?;
+
+    Ok(space)
+}
+
+async fn retrieve_project(app_state: &AppState, space: &Space) -> Result<Project> {
+    info!("retrieving the user project");
+    let node_manager = app_state.node_manager.get().read().await;
+    let projects = {
+        node_manager
+            .list_projects(&app_state.context(), &CloudOpts::route())
+            .await
+            .map_err(|e| miette!(e))?
+    };
+    let project = match projects.iter().find(|p| p.name == *PROJECT_NAME) {
+        Some(project) => project.clone(),
+        None => node_manager
+            .create_project(
+                &app_state.context(),
+                &CloudOpts::route(),
+                space.id.as_str(),
+                PROJECT_NAME,
+                vec![],
+            )
+            .await
+            .map_err(|e| miette!(e))?,
+    };
+    app_state
+        .state()
+        .await
+        .projects
+        .overwrite(&project.name, project.clone())?;
+
+    Ok(project)
 }

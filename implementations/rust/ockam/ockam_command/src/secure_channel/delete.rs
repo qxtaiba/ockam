@@ -53,7 +53,7 @@ impl DeleteCommand {
     ) {
         match response.channel {
             Some(address) => {
-                let route = &route![address.to_string()];
+                let route = &route![address];
                 match route_to_multiaddr(route) {
                     Some(multiaddr) => {
                         // if stdout is not interactive/tty write the secure channel address to it
@@ -155,7 +155,7 @@ async fn rpc(ctx: Context, (opts, cmd): (CommandGlobalOpts, DeleteCommand)) -> m
         let address = &cmd.address;
         let mut rpc = Rpc::background(&ctx, &opts, &node_name)?;
         rpc.request(api::delete_secure_channel(address)).await?;
-        let res = rpc.parse_response::<DeleteSecureChannelResponse>()?;
+        let res = rpc.parse_response_body::<DeleteSecureChannelResponse>()?;
         cmd.print_output(&node_name, address, &opts, res);
     }
     Ok(())

@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 
 use crate::{
+    credential::validate_encoded_cred,
     fmt_log, fmt_ok,
     terminal::OckamColor,
     util::{node_rpc, random_name},
+    vault::default_vault_name,
     CommandGlobalOpts, Result,
 };
 use colorful::Colorful;
@@ -74,13 +76,33 @@ async fn run_impl(
             }
         };
 
+        let vault_name = cmd
+            .vault
+            .clone()
+            .unwrap_or_else(|| default_vault_name(&opts.state));
+
+        let issuer = match &cmd.identity().await {
+            Ok(i) => i,
+            Err(_) => {
+                *is_finished.lock().await = true;
+                return Err(miette!("Issuer is invalid").into());
+            }
+        }
+        .identifier();
+
+        if let Err(e) = validate_encoded_cred(&cred_as_str, &issuer, &vault_name, &opts).await {
+            *is_finished.lock().await = true;
+            return Err(miette!("Credential is invalid\n{}", e).into());
+        }
+
         // store
         opts.state.credentials.create(
             &cmd.credential_name,
-            CredentialConfig::new(cmd.identity().await?, cred_as_str.to_string())?,
+            CredentialConfig::new(cmd.identity().await?, cred_as_str.clone())?,
         )?;
 
         *is_finished.lock().await = true;
+
         Ok(cred_as_str)
     };
 
@@ -90,16 +112,16 @@ async fn run_impl(
         .terminal
         .progress_output(&output_messages, &is_finished);
 
-    let (cred_as_str, _) = try_join!(send_req, progress_output)?;
+    let (credential, _) = try_join!(send_req, progress_output)?;
 
     opts.terminal
         .stdout()
-        .machine(cred_as_str.to_string())
+        .machine(credential.to_string())
         .json(serde_json::json!(
             {
                 "name": cmd.credential_name,
                 "issuer": cmd.issuer,
-                "credential": cred_as_str
+                "credential": credential
             }
         ))
         .plain(fmt_ok!(

@@ -15,9 +15,8 @@ use ockam_api::cloud::project::{OktaConfig, Project};
 use ockam_api::cloud::CloudRequestWrapper;
 use ockam_api::minicbor_url::Url;
 use ockam_core::api::Request;
-use ockam_core::CowStr;
 
-use crate::enroll::{Auth0Service, OktaAuth0Provider};
+use crate::enroll::{OidcService, OktaOidcProvider};
 use crate::node::util::delete_embedded_node;
 use crate::operation::util::check_for_completion;
 use crate::project::addon::configure_addon_endpoint;
@@ -119,11 +118,11 @@ async fn run_impl(
         _ => query_certificate_chain(domain)?,
     };
 
-    let okta_config = OktaConfig::new(base_url, certificate, client_id, &attributes);
+    let okta_config = OktaConfig::new(base_url, certificate, client_id, attributes);
     let body = okta_config.clone();
 
     // Validate okta configuration
-    let auth0 = Auth0Service::new(Arc::new(OktaAuth0Provider::new(okta_config.into())));
+    let auth0 = OidcService::new(Arc::new(OktaOidcProvider::new(okta_config.into())));
     auth0.validate_provider_config().await?;
 
     // Do request
@@ -133,13 +132,9 @@ async fn run_impl(
         configure_addon_endpoint(&opts.state, &project_name)?,
         addon_id
     );
-    let req = Request::post(endpoint).body(CloudRequestWrapper::new(
-        body,
-        controller_route,
-        None::<CowStr>,
-    ));
+    let req = Request::post(endpoint).body(CloudRequestWrapper::new(body, controller_route, None));
     rpc.request(req).await?;
-    let res = rpc.parse_response::<CreateOperationResponse>()?;
+    let res = rpc.parse_response_body::<CreateOperationResponse>()?;
     let operation_id = res.operation_id;
 
     check_for_completion(&ctx, &opts, rpc.node_name(), &operation_id).await?;
@@ -147,7 +142,7 @@ async fn run_impl(
     let project_id = opts.state.projects.get(&project_name)?.config().id.clone();
     rpc.request(api::project::show(&project_id, controller_route))
         .await?;
-    let project: Project = rpc.parse_response()?;
+    let project: Project = rpc.parse_response_body()?;
     check_project_readiness(&ctx, &opts, rpc.node_name(), None, project).await?;
 
     opts.terminal

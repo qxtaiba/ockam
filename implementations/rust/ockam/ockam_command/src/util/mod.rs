@@ -1,5 +1,4 @@
 use core::time::Duration;
-
 use std::{
     net::{SocketAddr, TcpListener},
     path::Path,
@@ -8,9 +7,8 @@ use std::{
 
 use miette::Context as _;
 use miette::{miette, IntoDiagnostic};
-use minicbor::{data::Type, Decode, Decoder, Encode};
-
-use tracing::{debug, error, trace};
+use minicbor::{Decode, Decoder, Encode};
+use tracing::{debug, error};
 
 use ockam::{
     Address, Context, MessageSendReceiveOptions, NodeBuilder, Route, TcpConnectionOptions,
@@ -19,7 +17,7 @@ use ockam::{
 use ockam_api::cli_state::{CliState, StateDirTrait, StateItemTrait};
 use ockam_api::config::lookup::{InternetAddress, LookupMeta};
 use ockam_api::nodes::NODEMANAGER_ADDR;
-use ockam_core::api::{Error, RequestBuilder, Response, Status};
+use ockam_core::api::{Error, RequestBuilder, Response};
 use ockam_core::DenyAll;
 use ockam_multiaddr::proto::{DnsAddr, Ip4, Ip6, Project, Service, Space, Tcp};
 use ockam_multiaddr::{
@@ -137,7 +135,7 @@ impl<'a> Rpc<'a> {
         &self.node_name
     }
 
-    pub async fn request<T>(&mut self, req: RequestBuilder<'_, T>) -> Result<()>
+    pub async fn request<T>(&mut self, req: RequestBuilder<T>) -> Result<()>
     where
         T: Encode<()>,
     {
@@ -152,7 +150,7 @@ impl<'a> Rpc<'a> {
             })?;
 
         if self.is_ok().is_err() {
-            let err: Error = self.parse_response()?;
+            let err: Error = self.parse_response_body()?;
             let err_msg = err.message().unwrap_or_default().to_string();
             return Err(miette!(err_msg).into());
         }
@@ -161,7 +159,7 @@ impl<'a> Rpc<'a> {
 
     pub async fn request_with_timeout<T>(
         &mut self,
-        req: RequestBuilder<'_, T>,
+        req: RequestBuilder<T>,
         timeout: Duration,
     ) -> Result<()>
     where
@@ -179,7 +177,7 @@ impl<'a> Rpc<'a> {
             })?.body();
 
         if self.is_ok().is_err() {
-            let err: Error = self.parse_response()?;
+            let err: Error = self.parse_response_body()?;
             let err_msg = err.message().unwrap_or_default().to_string();
             return Err(miette!(err_msg).into());
         }
@@ -219,88 +217,36 @@ impl<'a> Rpc<'a> {
     }
 
     /// Parse the response body and return it.
-    pub fn parse_response<T>(&'a self) -> Result<T>
+    pub fn parse_response_body<T>(&self) -> Result<T>
     where
-        T: Decode<'a, ()>,
+        T: for<'b> Decode<'b, ()>,
     {
-        let mut dec = self.parse_response_impl()?;
-        match dec.decode() {
-            Ok(t) => Ok(t),
-            Err(e) => {
-                error!(%e, dec = %minicbor::display(&self.buf), hex = %hex::encode(&self.buf), "Failed to decode response");
-                Err(miette!("Failed to decode response body: {}", e).into())
-            }
-        }
+        Response::parse_response_body(self.buf.as_slice()).map_err(|e| miette!(e).into())
     }
 
     /// Check response's status code is OK.
     pub fn is_ok(&self) -> Result<()> {
-        self.parse_response_impl()?;
-        Ok(())
-    }
-
-    pub fn check_response(&self) -> Result<(Response, Decoder)> {
-        let mut dec = Decoder::new(&self.buf);
-        let hdr = dec
-            .decode::<Response>()
-            .into_diagnostic()
-            .context("Failed to decode response header")?;
-        Ok((hdr, dec))
-    }
-
-    /// Parse the header and returns the decoder.
-    fn parse_response_impl(&self) -> Result<Decoder> {
-        let mut dec = Decoder::new(&self.buf);
-        let hdr = dec
-            .decode::<Response>()
-            .into_diagnostic()
-            .context("Failed to decode response header")?;
-        if hdr.status() == Some(Status::Ok) {
-            Ok(dec)
+        let (response, decoder) = Response::parse_response_header(self.buf.as_slice())?;
+        if !response.is_ok() {
+            Err(miette!(Response::parse_err_msg(response, decoder)).into())
         } else {
-            let msg = self.parse_err_msg(hdr, dec);
-            Err(miette!(msg).into())
+            Ok(())
         }
     }
 
-    pub fn parse_err_msg(&self, hdr: Response, mut dec: Decoder) -> String {
-        trace! {
-            dec = %minicbor::display(&self.buf),
-            hex = %hex::encode(&self.buf),
-            "Received CBOR message"
-        };
-        match hdr.status() {
-            Some(status) if hdr.has_body() => {
-                let err = if matches!(dec.datatype(), Ok(Type::String)) {
-                    dec.decode::<String>()
-                        .map(|msg| format!("Message: {msg}"))
-                        .unwrap_or_default()
-                } else {
-                    dec.decode::<ockam_core::api::Error>()
-                        .map(|e| {
-                            e.message()
-                                .map(|msg| format!("Message: {msg}"))
-                                .unwrap_or_default()
-                        })
-                        .unwrap_or_default()
-                };
-                format!(
-                    "An error occurred while processing the request. Status code: {status}. {err}"
-                )
-            }
-            Some(status) => {
-                format!("An error occurred while processing the request. Status code: {status}")
-            }
-            None => "No status code found in response".to_string(),
-        }
+    pub fn parse_response_header(&self) -> Result<(Response, Decoder)> {
+        let (response, decoder) = Response::parse_response_header(self.buf.as_slice())
+            .into_diagnostic()
+            .context("Failed to decode response header")?;
+        Ok((response, decoder))
     }
 
     /// Parse the response body and print it.
-    pub fn parse_and_print_response<T>(&'a self) -> Result<T>
+    pub fn parse_and_print_response<T>(&self) -> Result<T>
     where
-        T: Decode<'a, ()> + Output + serde::Serialize,
+        T: for<'b> Decode<'b, ()> + Output + serde::Serialize,
     {
-        let b: T = self.parse_response()?;
+        let b: T = self.parse_response_body()?;
         self.print_response(b)
     }
 
@@ -638,12 +584,13 @@ pub fn random_name() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ockam_api::cli_state;
     use ockam_api::cli_state::identities::IdentityConfig;
     use ockam_api::cli_state::traits::StateDirTrait;
     use ockam_api::cli_state::{NodeConfig, VaultConfig};
     use ockam_api::nodes::models::transport::{CreateTransportJson, TransportMode, TransportType};
+
+    use super::*;
 
     #[test]
     fn test_parse_node_name() {

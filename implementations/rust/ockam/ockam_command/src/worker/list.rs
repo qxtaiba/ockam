@@ -54,7 +54,7 @@ async fn run_impl(
         rpc.request(api::list_workers()).await?;
 
         *is_finished.lock().await = true;
-        rpc.parse_response::<WorkerList>()
+        rpc.parse_response_body::<WorkerList>()
     };
 
     let output_messages = vec![format!(
@@ -80,7 +80,7 @@ async fn run_impl(
     Ok(())
 }
 
-impl Output for WorkerStatus<'_> {
+impl Output for WorkerStatus {
     fn output(&self) -> crate::Result<String> {
         Ok(format!(
             "Worker {}",

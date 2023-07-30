@@ -6,7 +6,7 @@ use ockam::compat::sync::Mutex;
 use ockam::identity::IdentityIdentifier;
 use ockam::remote::{RemoteForwarder, RemoteForwarderOptions};
 use ockam::Result;
-use ockam_core::api::{Error, Id, Request, Response, ResponseBuilder, Status};
+use ockam_core::api::{Error, Request, Response, ResponseBuilder};
 use ockam_core::AsyncTryClone;
 use ockam_multiaddr::MultiAddr;
 use ockam_node::tokio::time::timeout;
@@ -22,16 +22,32 @@ use crate::session::sessions::{MAX_CONNECT_TIME, MAX_RECOVERY_TIME};
 use super::{NodeManager, NodeManagerWorker};
 
 impl NodeManagerWorker {
-    pub(super) async fn create_forwarder(
-        &mut self,
-        ctx: &mut Context,
-        rid: Id,
+    pub(super) async fn create_forwarder_response(
+        &self,
+        ctx: &Context,
+        req: &Request,
         dec: &mut Decoder<'_>,
     ) -> Result<Vec<u8>> {
-        let manager = self.node_manager.clone();
-        let req: CreateForwarder = dec.decode()?;
+        let req_body: CreateForwarder = dec.decode()?;
+        match self.create_forwarder(ctx, req_body).await {
+            Ok(body) => Ok(Response::ok(req.id()).body(body).to_vec()?),
+            Err(err) => {
+                let err = Error::new(req.path())
+                    .with_message("Failed to create forwarder")
+                    .with_cause(Error::new(req.path()).with_message(err.to_string()));
+                Ok(Response::internal_error(req.id()).body(err).to_vec()?)
+            }
+        }
+    }
 
+    pub async fn create_forwarder(
+        &self,
+        ctx: &Context,
+        req: CreateForwarder,
+    ) -> Result<ForwarderInfo> {
         debug!(addr = %req.address(), alias = ?req.alias(), "Handling CreateForwarder request");
+
+        let manager = self.node_manager.clone();
 
         let connection = Connection::new(ctx, req.address())
             .with_authorized_identity(req.authorized())
@@ -77,7 +93,7 @@ impl NodeManagerWorker {
                 let node_manager = self.node_manager.write().await;
                 let mut session = Session::new(ping_route);
                 session.set_replacer(repl);
-                node_manager.sessions.lock().unwrap().add(session);
+                node_manager.add_session(session);
             }
             result
         };
@@ -86,7 +102,7 @@ impl NodeManagerWorker {
             Ok(info) => {
                 let registry_info = info.clone();
                 let registry_remote_address = registry_info.remote_address().to_string();
-                let res_body = ForwarderInfo::from(info);
+                let forwarder_info = ForwarderInfo::from(info);
                 let mut node_manager = self.node_manager.write().await;
                 node_manager
                     .registry
@@ -94,27 +110,25 @@ impl NodeManagerWorker {
                     .insert(registry_remote_address, registry_info);
 
                 debug!(
-                    forwarding_route = %res_body.forwarding_route(),
-                    remote_address = %res_body.remote_address_ma()?,
+                    forwarding_route = %forwarder_info.forwarding_route(),
+                    remote_address = %forwarder_info.remote_address_ma()?,
                     "CreateForwarder request processed, sending back response"
                 );
-                Ok(Response::ok(rid).body(res_body).to_vec()?)
+                Ok(forwarder_info)
             }
             Err(err) => {
                 error!(?err, "Failed to create forwarder");
-                Ok(Response::builder(rid, Status::InternalServerError)
-                    .body(err.to_string())
-                    .to_vec()?)
+                Err(err)
             }
         }
     }
 
-    pub(super) async fn delete_forwarder<'a>(
+    pub(super) async fn delete_forwarder(
         &mut self,
         ctx: &mut Context,
-        req: &Request<'_>,
-        remote_address: &'a str,
-    ) -> Result<ResponseBuilder<Option<ForwarderInfo<'a>>>, ResponseBuilder<Error>> {
+        req: &Request,
+        remote_address: &str,
+    ) -> Result<ResponseBuilder<Option<ForwarderInfo>>, ResponseBuilder<Error>> {
         let mut node_manager = self.node_manager.write().await;
 
         debug!(%remote_address , "Handling DeleteForwarder request");
@@ -149,11 +163,11 @@ impl NodeManagerWorker {
         }
     }
 
-    pub(super) async fn show_forwarder<'a>(
+    pub(super) async fn show_forwarder(
         &mut self,
-        req: &Request<'_>,
-        remote_address: &'a str,
-    ) -> Result<ResponseBuilder<Option<ForwarderInfo<'a>>>, ResponseBuilder<Error>> {
+        req: &Request,
+        remote_address: &str,
+    ) -> Result<ResponseBuilder<Option<ForwarderInfo>>, ResponseBuilder<Error>> {
         debug!("Handling ShowForwarder request");
         let node_manager = self.node_manager.read().await;
         if let Some(forwarder_to_show) = node_manager.registry.forwarders.get(remote_address) {
@@ -172,10 +186,10 @@ impl NodeManagerWorker {
         }
     }
 
-    pub(super) async fn get_forwarders<'a>(
+    pub(super) async fn get_forwarders(
         &mut self,
-        req: &Request<'a>,
-    ) -> ResponseBuilder<Vec<ForwarderInfo<'a>>> {
+        req: &Request,
+    ) -> ResponseBuilder<Vec<ForwarderInfo>> {
         debug!("Handling ListForwarders request");
         let registry = &self.node_manager.read().await.registry.forwarders;
         Response::ok(req.id()).body(

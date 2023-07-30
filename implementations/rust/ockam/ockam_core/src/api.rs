@@ -1,19 +1,11 @@
 #![allow(missing_docs)]
 
-use crate::alloc::string::ToString;
-use crate::compat::borrow::Cow;
-use crate::compat::boxed::Box;
-use crate::compat::rand;
-use crate::compat::string::String;
-use crate::compat::vec::Vec;
-use crate::errcode::{Kind, Origin};
-use crate::Result;
 use core::fmt::{self, Display, Formatter};
+
+use minicbor::data::Type;
 use minicbor::encode::{self, Encoder, Write};
 use minicbor::{Decode, Decoder, Encode};
 use tinyvec::ArrayVec;
-
-pub const SCHEMA: &str = core::include_str!("schema.cddl");
 
 #[cfg(feature = "tag")]
 use {
@@ -22,6 +14,16 @@ use {
     cddl_cat::{context::BasicContext, flatten::flatten, parse_cddl},
     once_cell::race::OnceBox,
 };
+
+use crate::alloc::string::ToString;
+use crate::compat::boxed::Box;
+use crate::compat::rand;
+use crate::compat::string::String;
+use crate::compat::vec::Vec;
+use crate::errcode::{Kind, Origin};
+use crate::Result;
+
+pub const SCHEMA: &str = core::include_str!("schema.cddl");
 
 #[cfg(feature = "tag")]
 pub fn merged_cddl(cddl_schemas: &[&str]) -> Result<BasicContext> {
@@ -75,7 +77,7 @@ pub fn cddl() -> &'static BasicContext {
 #[derive(Debug, Clone, Encode, Decode)]
 #[rustfmt::skip]
 #[cbor(map)]
-pub struct Request<'a> {
+pub struct Request {
     /// Nominal type tag.
     ///
     /// If the "tag" feature is enabled, the resulting CBOR will contain a
@@ -87,7 +89,7 @@ pub struct Request<'a> {
     /// The request identifier.
     #[n(1)] id: Id,
     /// The resource path.
-    #[b(2)] path: Cow<'a, str>,
+    #[n(2)] path: String,
     /// The request method.
     ///
     /// It is wrapped in an `Option` to be forwards compatible, i.e. adding
@@ -123,6 +125,90 @@ pub struct Response {
     #[n(3)] status: Option<Status>,
     /// Indicator if a response body is expected after this header.
     #[n(4)] has_body: bool,
+}
+
+impl Response {
+    /// Return true if the status is defined and Ok
+    pub fn is_ok(&self) -> bool {
+        self.status.map(|s| s == Status::Ok).unwrap_or(false)
+    }
+
+    /// Parse the response header and if it is ok
+    /// parse the response body
+    pub fn parse_response_body<T>(bytes: &[u8]) -> Result<T>
+    where
+        T: for<'a> Decode<'a, ()>,
+    {
+        let (response, mut decoder) = Self::parse_response_header(bytes)?;
+        if response.is_ok() {
+            if response.has_body() {
+                match decoder.decode() {
+                    Ok(t) => Ok(t),
+                    Err(e) => {
+                        #[cfg(all(feature = "alloc", feature = "minicbor/half"))]
+                        error!(%e, dec = %minicbor::display(bytes), hex = %hex::encode(bytes), "Failed to decode response");
+                        Err(crate::Error::new(
+                            Origin::Api,
+                            Kind::Serialization,
+                            format!("Failed to decode response body: {}", e),
+                        ))
+                    }
+                }
+            } else {
+                Err(crate::Error::new(
+                    Origin::Api,
+                    Kind::Serialization,
+                    "expected a message body, got nothing".to_string(),
+                ))
+            }
+        } else {
+            let msg = Self::parse_err_msg(response, decoder);
+            Err(crate::Error::new(Origin::Api, Kind::Serialization, msg))
+        }
+    }
+
+    /// Parse the response header and return it + the Decoder to continue parsing if necessary
+    pub fn parse_response_header(bytes: &[u8]) -> Result<(Response, Decoder)> {
+        #[cfg(all(feature = "alloc", feature = "minicbor/half"))]
+        trace! {
+            dec = %minicbor::display(bytes),
+            hex = %hex::encode(bytes),
+            "Received CBOR message"
+        };
+
+        let mut dec = Decoder::new(bytes);
+        let hdr = dec.decode::<Response>()?;
+        Ok((hdr, dec))
+    }
+
+    /// If the response is not successful and the response has a body
+    /// parse the response body as an error
+    pub fn parse_err_msg(response: Response, mut dec: Decoder) -> String {
+        match response.status() {
+            Some(status) if response.has_body() => {
+                let err = if matches!(dec.datatype(), Ok(Type::String)) {
+                    dec.decode::<String>()
+                        .map(|msg| format!("Message: {msg}"))
+                        .unwrap_or_default()
+                } else {
+                    dec.decode::<Error>()
+                        .map(|e| {
+                            e.message()
+                                .map(|msg| format!("Message: {msg}"))
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                };
+                format!(
+                    "An error occurred while processing the request. Status code: {status}. {err}"
+                )
+            }
+            Some(status) => {
+                format!("An error occurred while processing the request. Status code: {status}")
+            }
+            None => "No status code found in response".to_string(),
+        }
+    }
 }
 
 /// Create an error response because the request path was unknown.
@@ -252,8 +338,8 @@ impl Display for Id {
     }
 }
 
-impl<'a> Request<'a> {
-    pub fn new<P: Into<Cow<'a, str>>>(method: Method, path: P, has_body: bool) -> Self {
+impl Request {
+    pub fn new<P: Into<String>>(method: Method, path: P, has_body: bool) -> Self {
         Request {
             #[cfg(feature = "tag")]
             tag: TypeTag,
@@ -264,30 +350,30 @@ impl<'a> Request<'a> {
         }
     }
 
-    pub fn builder<P: Into<Cow<'a, str>>>(method: Method, path: P) -> RequestBuilder<'a> {
+    pub fn builder<P: Into<String>>(method: Method, path: P) -> RequestBuilder {
         RequestBuilder {
             header: Request::new(method, path, false),
             body: None,
         }
     }
 
-    pub fn get<P: Into<Cow<'a, str>>>(path: P) -> RequestBuilder<'a> {
+    pub fn get<P: Into<String>>(path: P) -> RequestBuilder {
         Request::builder(Method::Get, path)
     }
 
-    pub fn post<P: Into<Cow<'a, str>>>(path: P) -> RequestBuilder<'a> {
+    pub fn post<P: Into<String>>(path: P) -> RequestBuilder {
         Request::builder(Method::Post, path)
     }
 
-    pub fn put<P: Into<Cow<'a, str>>>(path: P) -> RequestBuilder<'a> {
+    pub fn put<P: Into<String>>(path: P) -> RequestBuilder {
         Request::builder(Method::Put, path)
     }
 
-    pub fn delete<P: Into<Cow<'a, str>>>(path: P) -> RequestBuilder<'a> {
+    pub fn delete<P: Into<String>>(path: P) -> RequestBuilder {
         Request::builder(Method::Delete, path)
     }
 
-    pub fn patch<P: Into<Cow<'a, str>>>(path: P) -> RequestBuilder<'a> {
+    pub fn patch<P: Into<String>>(path: P) -> RequestBuilder {
         Request::builder(Method::Patch, path)
     }
 
@@ -390,11 +476,11 @@ pub struct Error {
     #[cfg(feature = "tag")]
     #[n(0)] tag: TypeTag<5359172>,
     /// The resource path of this error.
-    #[b(1)] path: Option<String>,
+    #[n(1)] path: Option<String>,
     /// The request method of this error.
     #[n(2)] method: Option<Method>,
     /// The actual error message.
-    #[b(3)] message: Option<String>,
+    #[n(3)] message: Option<String>,
     /// The cause of the error, if any.
     #[b(4)] cause: Option<Box<Error>>,
 
@@ -499,18 +585,18 @@ impl<'a, const N: usize> Segments<'a, N> {
 }
 
 #[derive(Debug)]
-pub struct RequestBuilder<'a, T = ()> {
-    header: Request<'a>,
+pub struct RequestBuilder<T = ()> {
+    header: Request,
     body: Option<T>,
 }
 
-impl<'a, T> RequestBuilder<'a, T> {
+impl<T> RequestBuilder<T> {
     pub fn id(mut self, id: Id) -> Self {
         self.header.id = id;
         self
     }
 
-    pub fn path<P: Into<Cow<'a, str>>>(mut self, path: P) -> Self {
+    pub fn path<P: Into<String>>(mut self, path: P) -> Self {
         self.header.path = path.into();
         self
     }
@@ -520,17 +606,17 @@ impl<'a, T> RequestBuilder<'a, T> {
         self
     }
 
-    pub fn header(&self) -> &Request<'a> {
+    pub fn header(&self) -> &Request {
         &self.header
     }
 
-    pub fn into_parts(self) -> (Request<'a>, Option<T>) {
+    pub fn into_parts(self) -> (Request, Option<T>) {
         (self.header, self.body)
     }
 }
 
-impl<'a> RequestBuilder<'a, ()> {
-    pub fn body<T: Encode<()>>(self, b: T) -> RequestBuilder<'a, T> {
+impl RequestBuilder<()> {
+    pub fn body<T: Encode<()>>(self, b: T) -> RequestBuilder<T> {
         let mut b = RequestBuilder {
             header: self.header,
             body: Some(b),
@@ -540,7 +626,7 @@ impl<'a> RequestBuilder<'a, ()> {
     }
 }
 
-impl<'a, T: Encode<()>> RequestBuilder<'a, T> {
+impl<T: Encode<()>> RequestBuilder<T> {
     pub fn encode<W>(&self, buf: W) -> Result<(), encode::Error<W::Error>>
     where
         W: Write,
@@ -850,9 +936,10 @@ mod merged_cddl_test {
 #[cfg(test)]
 #[cfg(feature = "tag")]
 mod schema_test {
-    use super::*;
     use cddl_cat::validate_cbor_bytes;
     use quickcheck::{quickcheck, Arbitrary, Gen, TestResult};
+
+    use super::*;
 
     const METHODS: &[Method] = &[
         Method::Get,
@@ -872,7 +959,7 @@ mod schema_test {
     ];
 
     #[derive(Debug, Clone)]
-    struct Req(Request<'static>);
+    struct Req(Request);
 
     #[derive(Debug, Clone)]
     struct Res(Response);

@@ -44,7 +44,7 @@ pub async fn run_impl(
     rpc.request(make_api_request(cmd)?).await?;
     rpc.is_ok()?;
 
-    let inlet_to_show = rpc.parse_response::<InletStatus>()?;
+    let inlet_to_show = rpc.parse_response_body::<InletStatus>()?;
 
     println!("Inlet:");
     println!("  Alias: {}", inlet_to_show.alias);
@@ -58,7 +58,7 @@ pub async fn run_impl(
 }
 
 /// Construct a request to show a tcp inlet
-fn make_api_request<'a>(cmd: ShowCommand) -> Result<RequestBuilder<'a>> {
+fn make_api_request(cmd: ShowCommand) -> Result<RequestBuilder> {
     let alias = cmd.alias;
     let request = Request::get(format!("/node/inlet/{alias}"));
     Ok(request)

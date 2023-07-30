@@ -56,7 +56,7 @@ async fn run_impl(
 
     let send_req = async {
         rpc.request(api::list_services()).await?;
-        let r = rpc.parse_response::<ServiceList>()?;
+        let r = rpc.parse_response_body::<ServiceList>()?;
 
         *is_finished.lock().await = true;
         crate::Result::Ok(r)
@@ -90,7 +90,7 @@ async fn run_impl(
     Ok(())
 }
 
-impl Output for ServiceStatus<'_> {
+impl Output for ServiceStatus {
     fn output(&self) -> crate::Result<String> {
         let mut output = String::new();
 

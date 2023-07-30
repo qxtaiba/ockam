@@ -20,11 +20,7 @@ use ockam::{
 use ockam_abac::expr::{and, eq, ident, str};
 use ockam_abac::{Action, Env, Expr, PolicyAccessControl, PolicyStorage, Resource};
 use ockam_core::api::{Error, Method, Request, Response, ResponseBuilder, Status};
-use ockam_core::compat::{
-    boxed::Box,
-    string::String,
-    sync::{Arc, Mutex},
-};
+use ockam_core::compat::{boxed::Box, string::String, sync::Arc};
 use ockam_core::errcode::{Kind, Origin};
 use ockam_core::flow_control::FlowControlId;
 use ockam_core::IncomingAccessControl;
@@ -32,8 +28,6 @@ use ockam_core::{AllowAll, AsyncTryClone};
 use ockam_identity::TrustContext;
 use ockam_multiaddr::MultiAddr;
 use ockam_node::compat::asynchronous::RwLock;
-use ockam_node::tokio;
-use ockam_node::tokio::task::JoinHandle;
 
 use crate::bootstrapped_identities_store::BootstrapedIdentityStore;
 use crate::bootstrapped_identities_store::PreTrustedIdentities;
@@ -46,11 +40,12 @@ use crate::nodes::connection::{
     ProjectInstantiator, SecureChannelInstantiator,
 };
 use crate::nodes::models::base::NodeStatus;
+use crate::nodes::models::portal::{OutletList, OutletStatus};
 use crate::nodes::models::transport::{TransportMode, TransportType};
 use crate::nodes::models::workers::{WorkerList, WorkerStatus};
 use crate::nodes::registry::KafkaServiceKind;
-use crate::session::sessions::Sessions;
-use crate::session::Medic;
+use crate::session::sessions::{Key, Session};
+use crate::session::MedicHandle;
 use crate::DefaultAddress;
 use crate::RpcProxyService;
 
@@ -109,11 +104,9 @@ pub struct NodeManager {
     enable_credential_checks: bool,
     identifier: IdentityIdentifier,
     pub(crate) secure_channels: Arc<SecureChannels>,
-    projects: Arc<BTreeMap<String, ProjectLookup>>,
     trust_context: Option<TrustContext>,
     pub(crate) registry: Registry,
-    sessions: Arc<Mutex<Sessions>>,
-    medic: JoinHandle<Result<(), ockam_core::Error>>,
+    medic_handle: MedicHandle,
     policies: Arc<dyn PolicyStorage>,
 }
 
@@ -149,6 +142,18 @@ impl NodeManager {
     pub(super) fn secure_channels_vault(&self) -> Arc<dyn IdentitiesVault> {
         self.secure_channels.vault().clone()
     }
+
+    pub fn list_outlets(&self) -> OutletList {
+        let outlets = self.registry.outlets.clone();
+        OutletList::new(
+            outlets
+                .iter()
+                .map(|(alias, info)| {
+                    OutletStatus::new(&info.tcp_addr, info.worker_addr.to_string(), alias, None)
+                })
+                .collect(),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -163,8 +168,22 @@ impl NodeManagerWorker {
         }
     }
 
-    pub fn get(&mut self) -> &mut Arc<RwLock<NodeManager>> {
+    pub fn get(&self) -> &Arc<RwLock<NodeManager>> {
+        &self.node_manager
+    }
+
+    pub fn get_mut(&mut self) -> &mut Arc<RwLock<NodeManager>> {
         &mut self.node_manager
+    }
+
+    pub async fn set_node_manager(&self, node_manager: NodeManager) {
+        let mut nm = self.node_manager.write().await;
+        *nm = node_manager;
+    }
+
+    pub async fn stop(&self, ctx: &Context) -> Result<()> {
+        let nm = self.node_manager.read().await;
+        nm.medic_handle.stop_medic(ctx).await
     }
 }
 
@@ -252,16 +271,6 @@ impl NodeManagerGeneralOptions {
     }
 }
 
-pub struct NodeManagerProjectsOptions {
-    projects: BTreeMap<String, ProjectLookup>,
-}
-
-impl NodeManagerProjectsOptions {
-    pub fn new(projects: BTreeMap<String, ProjectLookup>) -> Self {
-        Self { projects }
-    }
-}
-
 #[derive(Clone)]
 /// Transport to build connection
 pub struct ApiTransport {
@@ -310,10 +319,10 @@ impl NodeManager {
     pub async fn create(
         ctx: &Context,
         general_options: NodeManagerGeneralOptions,
-        projects_options: NodeManagerProjectsOptions,
         transport_options: NodeManagerTransportOptions,
         trust_options: NodeManagerTrustOptions,
     ) -> Result<Self> {
+        debug!("create transports");
         let api_transport_id = random_alias();
         let mut transports = BTreeMap::new();
         transports.insert(
@@ -321,6 +330,7 @@ impl NodeManager {
             transport_options.api_transport_flow_control_id.clone(),
         );
 
+        debug!("create the identity repository");
         let cli_state = general_options.cli_state;
         let node_state = cli_state.nodes.get(&general_options.node_name)?;
 
@@ -339,6 +349,7 @@ impl NodeManager {
                 Some(f) => BootstrapedIdentityStore::new(Arc::new(f), repository.clone()),
             });
 
+        debug!("create the secure channels service");
         let secure_channels = SecureChannels::builder()
             .with_identities_vault(vault)
             .with_identities_repository(identities_repository.clone())
@@ -346,8 +357,8 @@ impl NodeManager {
 
         let policies: Arc<dyn PolicyStorage> = Arc::new(node_state.policies_storage().await?);
 
-        let medic = Medic::new();
-        let sessions = medic.sessions();
+        debug!("start the Medic");
+        let medic_handle = MedicHandle::start_medic(ctx).await?;
 
         let mut s = Self {
             cli_state,
@@ -365,25 +376,20 @@ impl NodeManager {
                     .is_ok(),
             identifier: node_state.config().identifier().await?,
             secure_channels,
-            projects: Arc::new(projects_options.projects),
             trust_context: None,
             registry: Default::default(),
-            medic: {
-                let ctx = ctx.async_try_clone().await?;
-                tokio::spawn(medic.start(ctx))
-            },
-            sessions,
+            medic_handle,
             policies,
         };
 
-        info!("NodeManager::create: {}", s.node_name);
         if !general_options.skip_defaults {
-            info!("NodeManager::create: starting default services");
+            debug!("starting default services");
             if let Some(tc) = trust_options.trust_context_config {
-                info!("NodeManager::create: configuring trust context");
+                debug!("configuring trust context");
                 s.configure_trust_context(&tc).await?;
             }
         }
+        info!("created a node manager for the node: {}", s.node_name);
 
         Ok(s)
     }
@@ -494,8 +500,14 @@ impl NodeManager {
         Ok(connection_instance)
     }
 
-    pub(crate) fn resolve_project(&self, name: &str) -> Result<(MultiAddr, IdentityIdentifier)> {
-        if let Some(info) = self.projects.get(name) {
+    pub(crate) async fn resolve_project(
+        &self,
+        name: &str,
+    ) -> Result<(MultiAddr, IdentityIdentifier)> {
+        let projects = ProjectLookup::from_state(self.cli_state.projects.list()?)
+            .await
+            .map_err(|e| ApiError::message(format!("Cannot load projects: {:?}", e)))?;
+        if let Some(info) = projects.get(name) {
             let node_route = info
                 .node_route
                 .as_ref()
@@ -511,6 +523,10 @@ impl NodeManager {
             Err(ApiError::message(format!("project {name} not found")))
         }
     }
+
+    pub fn add_session(&self, session: Session) -> Key {
+        self.medic_handle.add_session(session)
+    }
 }
 
 impl NodeManagerWorker {
@@ -519,7 +535,7 @@ impl NodeManagerWorker {
     async fn handle_request(
         &mut self,
         ctx: &mut Context,
-        req: &Request<'_>,
+        req: &Request,
         dec: &mut Decoder<'_>,
     ) -> Result<Vec<u8>> {
         debug! {
@@ -677,7 +693,7 @@ impl NodeManagerWorker {
             (Delete, ["node", "forwarder", remote_address]) => {
                 encode_request_result(self.delete_forwarder(ctx, req, remote_address).await)?
             }
-            (Post, ["node", "forwarder"]) => self.create_forwarder(ctx, req.id(), dec).await?,
+            (Post, ["node", "forwarder"]) => self.create_forwarder_response(ctx, req, dec).await?,
 
             // ==*== Inlets & Outlets ==*==
             (Get, ["node", "inlet"]) => self.get_inlets(req).await.to_vec()?,
@@ -692,7 +708,7 @@ impl NodeManagerWorker {
                 encode_request_result(self.create_inlet(req, dec, ctx).await)?
             }
             (Post, ["node", "outlet"]) => {
-                encode_request_result(self.create_outlet(ctx, req, dec).await)?
+                encode_request_result(self.create_outlet(ctx, req, dec.decode()?).await)?
             }
             (Delete, ["node", "outlet", alias]) => {
                 encode_request_result(self.delete_outlet(req, alias).await)?
@@ -750,23 +766,36 @@ impl NodeManagerWorker {
             )?,
 
             // ==*== Spaces ==*==
-            (Post, ["v0", "spaces"]) => self.create_space(ctx, dec).await?,
-            (Get, ["v0", "spaces"]) => self.list_spaces(ctx, dec).await?,
-            (Get, ["v0", "spaces", id]) => self.get_space(ctx, dec, id).await?,
-            (Delete, ["v0", "spaces", id]) => self.delete_space(ctx, dec, id).await?,
+            (Post, ["v0", "spaces"]) => self.create_space_response(ctx, dec.decode()?).await?,
+            (Get, ["v0", "spaces"]) => self.list_spaces_response(ctx, dec.decode()?).await?,
+            (Get, ["v0", "spaces", id]) => self.get_space_response(ctx, dec.decode()?, id).await?,
+            (Delete, ["v0", "spaces", id]) => {
+                self.delete_space_response(ctx, dec.decode()?, id).await?
+            }
 
             // ==*== Projects ==*==
             (Post, ["v1", "spaces", space_id, "projects"]) => {
-                self.create_project(ctx, dec, space_id).await?
+                self.create_project_response(ctx, dec.decode()?, space_id)
+                    .await?
             }
-            (Get, ["v0", "projects"]) => self.list_projects(ctx, dec).await?,
-            (Get, ["v0", "projects", project_id]) => self.get_project(ctx, dec, project_id).await?,
+            (Get, ["v0", "projects", "version_info"]) => {
+                self.get_project_version_response(ctx, dec.decode()?)
+                    .await?
+            }
+            (Get, ["v0", "projects"]) => self.list_projects_response(ctx, dec.decode()?).await?,
+            (Get, ["v0", "projects", project_id]) => {
+                self.get_project_response(ctx, dec.decode()?, project_id)
+                    .await?
+            }
             (Delete, ["v0", "projects", space_id, project_id]) => {
-                self.delete_project(ctx, dec, space_id, project_id).await?
+                self.delete_project_response(ctx, dec.decode()?, space_id, project_id)
+                    .await?
             }
 
             // ==*== Enroll ==*==
-            (Post, ["v0", "enroll", "auth0"]) => self.enroll_auth0(ctx, dec).await?,
+            (Post, ["v0", "enroll", "auth0"]) => {
+                self.enroll_auth0_response(ctx, dec.decode()?).await?
+            }
             (Get, ["v0", "enroll", "token"]) => self.generate_enrollment_token(ctx, dec).await?,
             (Put, ["v0", "enroll", "token"]) => {
                 self.authenticate_enrollment_token(ctx, dec).await?
@@ -844,10 +873,9 @@ impl Worker for NodeManagerWorker {
         Ok(())
     }
 
-    async fn shutdown(&mut self, _: &mut Self::Context) -> Result<()> {
+    async fn shutdown(&mut self, ctx: &mut Self::Context) -> Result<()> {
         let node_manager = self.node_manager.read().await;
-        node_manager.medic.abort();
-        Ok(())
+        node_manager.medic_handle.stop_medic(ctx).await
     }
 
     async fn handle_message(&mut self, ctx: &mut Context, msg: Routed<Vec<u8>>) -> Result<()> {

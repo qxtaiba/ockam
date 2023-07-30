@@ -4,6 +4,7 @@ use crate::util::{api, node_rpc, Rpc};
 use crate::{docs, CommandGlobalOpts, Result};
 use clap::Args;
 use colorful::Colorful;
+use indoc::formatdoc;
 use miette::Context as _;
 use ockam::Context;
 use ockam_api::cli_state::StateDirTrait;
@@ -59,7 +60,7 @@ async fn run_impl(
 
         let send_req = async {
             let node_status = if rpc.request(api::query_status()).await.is_ok() {
-                let resp = rpc.parse_response::<NodeStatus>()?;
+                let resp = rpc.parse_response_body::<NodeStatus>()?;
                 if let Ok(node_state) = opts.state.nodes.get(&node_name) {
                     // Update the persisted configuration data with the pids
                     // responded by nodes.
@@ -141,18 +142,19 @@ impl Output for NodeListOutput {
             ),
         };
         let default = match self.is_default {
-            true => "(default)".to_string(),
+            true => " (default)".to_string(),
             false => "".to_string(),
         };
 
-        let output = format!(
-            r#"Node {node_name} {default} {status}
-{pid}"#,
-            node_name = self
-                .node_name
-                .to_string()
-                .color(OckamColor::PrimaryResource.color()),
-        );
+        let output = formatdoc! {"
+        Node {node_name}{default} {status}
+        {pid}",
+        node_name = self
+            .node_name
+            .to_string()
+            .color(OckamColor::PrimaryResource.color()),
+        };
+
         Ok(output)
     }
 }

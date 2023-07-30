@@ -33,9 +33,9 @@ pub async fn check_for_completion<'a>(
             .await
             .is_ok()
         {
-            let operation = rpc.parse_response::<Operation>()?;
+            let operation = rpc.parse_response_body::<Operation>()?;
             if operation.is_completed() {
-                return Ok(operation.to_owned());
+                return Ok(operation);
             }
         }
         Err(miette!("Operation timed out. Please try again."))

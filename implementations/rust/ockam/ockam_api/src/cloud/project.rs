@@ -3,15 +3,14 @@ use std::str::FromStr;
 use minicbor::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
-use crate::cloud::addon::ConfluentConfigResponse;
 use ockam::identity::IdentityIdentifier;
-use ockam_core::CowStr;
 use ockam_core::Result;
 #[cfg(feature = "tag")]
 use ockam_core::TypeTag;
 use ockam_multiaddr::MultiAddr;
 use ockam_node::tokio;
 
+use crate::cloud::addon::ConfluentConfigResponse;
 use crate::error::ApiError;
 use crate::minicbor_url::Url;
 
@@ -69,10 +68,6 @@ pub struct Project {
 }
 
 impl Project {
-    pub fn to_owned(&self) -> Project {
-        self.clone()
-    }
-
     pub fn is_ready(&self) -> bool {
         !(self.access_route.is_empty()
             || self.authority_access_route.is_none()
@@ -100,29 +95,40 @@ impl Project {
     }
 }
 
+#[derive(Decode, Deserialize, Debug, Default, Clone, Eq, PartialEq)]
+#[cbor(map)]
+pub struct ProjectVersion {
+    #[cfg(feature = "tag")]
+    #[serde(skip)]
+    #[cbor(n(0))]
+    pub tag: TypeTag<9116532>,
+
+    #[cbor(n(1))]
+    pub version: Option<String>,
+
+    #[cbor(n(2))]
+    pub project_version: Option<String>,
+}
+
 #[derive(Encode, Decode, Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 #[rustfmt::skip]
 #[cbor(map)]
 pub struct OktaConfig {
     #[cfg(feature = "tag")]
     #[serde(skip)]
-    #[cbor(b(0))] pub tag: TypeTag<6434814>,
-
-    #[cbor(b(1))] pub tenant_base_url: Url,
-
-    #[cbor(b(2))] pub certificate: String,
-
-    #[cbor(b(3))] pub client_id: String,
-
-    #[cbor(b(4))] pub attributes: Vec<String>,
+    #[cbor(n(0))] pub tag: TypeTag<6434814>,
+    #[cbor(n(1))] pub tenant_base_url: Url,
+    #[cbor(n(2))] pub certificate: String,
+    #[cbor(n(3))] pub client_id: String,
+    #[cbor(n(4))] pub attributes: Vec<String>,
 }
 
-impl<'a> OktaConfig {
-    pub fn new<S: ToString, T: AsRef<str>>(
+impl OktaConfig {
+    pub fn new<S: ToString>(
         tenant_base_url: Url,
         certificate: S,
         client_id: S,
-        attributes: &'a [T],
+        attributes: Vec<String>,
     ) -> Self {
         Self {
             #[cfg(feature = "tag")]
@@ -130,7 +136,7 @@ impl<'a> OktaConfig {
             tenant_base_url,
             certificate: certificate.to_string(),
             client_id: client_id.to_string(),
-            attributes: attributes.iter().map(|x| x.as_ref().to_string()).collect(),
+            attributes,
         }
     }
 
@@ -176,34 +182,21 @@ impl From<OktaAuth0> for OktaConfig {
 #[derive(Encode, Decode, Serialize, Deserialize, Debug)]
 #[rustfmt::skip]
 #[cbor(map)]
-pub struct InfluxDBTokenLeaseManagerConfig<'a> {
+pub struct InfluxDBTokenLeaseManagerConfig {
     #[cfg(feature = "tag")]
     #[serde(skip)]
     #[cbor(n(0))] pub tag: TypeTag<4166488>,
-
-    #[serde(borrow)]
-    #[cbor(b(1))] pub endpoint: CowStr<'a>,
-
-    #[serde(borrow)]
-    #[cbor(b(2))] pub token: CowStr<'a>,
-
-    #[serde(borrow)]
-    #[cbor(b(3))] pub org_id: CowStr<'a>,
-
-    #[serde(borrow)]
-    #[cbor(b(4))] pub permissions: CowStr<'a>,
-
-    #[cbor(b(5))] pub max_ttl_secs: i32,
-
-    #[serde(borrow)]
-    #[cbor(b(6))] pub user_access_rule: Option<CowStr<'a>>,
-
-    #[serde(borrow)]
-    #[cbor(b(7))] pub admin_access_rule: Option<CowStr<'a>>,
+    #[cbor(n(1))] pub endpoint: String,
+    #[cbor(n(2))] pub token: String,
+    #[cbor(n(3))] pub org_id: String,
+    #[cbor(n(4))] pub permissions: String,
+    #[cbor(n(5))] pub max_ttl_secs: i32,
+    #[cbor(n(6))] pub user_access_rule: Option<String>,
+    #[cbor(n(7))] pub admin_access_rule: Option<String>,
 }
 
-impl<'a> InfluxDBTokenLeaseManagerConfig<'a> {
-    pub fn new<S: Into<CowStr<'a>>>(
+impl InfluxDBTokenLeaseManagerConfig {
+    pub fn new<S: Into<String>>(
         endpoint: S,
         token: S,
         org_id: S,
@@ -212,9 +205,9 @@ impl<'a> InfluxDBTokenLeaseManagerConfig<'a> {
         user_access_rule: Option<S>,
         admin_access_rule: Option<S>,
     ) -> Self {
-        let uar: Option<CowStr<'a>> = user_access_rule.map(|s| s.into());
+        let uar: Option<String> = user_access_rule.map(|s| s.into());
 
-        let aar: Option<CowStr<'a>> = admin_access_rule.map(|s| s.into());
+        let aar: Option<String> = admin_access_rule.map(|s| s.into());
 
         Self {
             #[cfg(feature = "tag")]
@@ -234,53 +227,69 @@ impl<'a> InfluxDBTokenLeaseManagerConfig<'a> {
 #[cfg_attr(test, derive(Clone))]
 #[rustfmt::skip]
 #[cbor(map)]
-pub struct CreateProject<'a> {
+pub struct CreateProject {
     #[cfg(feature = "tag")]
     #[n(0)] pub tag: TypeTag<8669570>,
-    #[b(1)] pub name: CowStr<'a>,
-    #[b(3)] pub users: Vec<CowStr<'a>>,
+    #[n(1)] pub name: String,
+    #[n(3)] pub users: Vec<String>,
 }
 
-impl<'a> CreateProject<'a> {
-    pub fn new<S: Into<CowStr<'a>>, T: AsRef<str>>(name: S, users: &'a [T]) -> Self {
+impl CreateProject {
+    pub fn new(name: String, users: Vec<String>) -> Self {
         Self {
             #[cfg(feature = "tag")]
             tag: TypeTag,
-            name: name.into(),
-            users: users.iter().map(|x| CowStr::from(x.as_ref())).collect(),
+            name,
+            users,
         }
     }
 }
 
 mod node {
-    use minicbor::Decoder;
     use tracing::trace;
 
-    use ockam_core::api::Request;
+    use ockam_core::api::{Request, Response};
     use ockam_core::{self, Result};
     use ockam_node::Context;
 
     use crate::cloud::{BareCloudRequestWrapper, CloudRequestWrapper};
-    use crate::nodes::NodeManagerWorker;
+    use crate::nodes::{NodeManager, NodeManagerWorker};
 
     use super::*;
 
     const TARGET: &str = "ockam_api::cloud::project";
 
-    impl NodeManagerWorker {
-        pub(crate) async fn create_project(
-            &mut self,
-            ctx: &mut Context,
-            dec: &mut Decoder<'_>,
+    impl NodeManager {
+        pub async fn create_project(
+            &self,
+            ctx: &Context,
+            route: &MultiAddr,
+            space_id: &str,
+            project_name: &str,
+            users: Vec<String>,
+        ) -> Result<Project> {
+            let request = CloudRequestWrapper::new(
+                CreateProject::new(project_name.to_string(), users),
+                route,
+                None,
+            );
+            Response::parse_response_body(
+                self.create_project_response(ctx, request, space_id)
+                    .await?
+                    .as_slice(),
+            )
+        }
+
+        pub(crate) async fn create_project_response(
+            &self,
+            ctx: &Context,
+            req_wrapper: CloudRequestWrapper<CreateProject>,
             space_id: &str,
         ) -> Result<Vec<u8>> {
-            let req_wrapper: CloudRequestWrapper<CreateProject> = dec.decode()?;
             let cloud_multiaddr = req_wrapper.multiaddr()?;
             let req_body = req_wrapper.req;
-
             let label = "create_project";
             trace!(target: TARGET, %space_id, project_name = %req_body.name, "creating project");
-
             let req_builder =
                 Request::post(format!("/v1/spaces/{space_id}/projects")).body(&req_body);
 
@@ -296,17 +305,25 @@ mod node {
             .await
         }
 
-        pub(crate) async fn list_projects(
-            &mut self,
-            ctx: &mut Context,
-            dec: &mut Decoder<'_>,
-        ) -> Result<Vec<u8>> {
-            let req_wrapper: BareCloudRequestWrapper = dec.decode()?;
-            let cloud_multiaddr = req_wrapper.multiaddr()?;
+        pub async fn list_projects(
+            &self,
+            ctx: &Context,
+            route: &MultiAddr,
+        ) -> Result<Vec<Project>> {
+            let bytes = self
+                .list_projects_response(ctx, CloudRequestWrapper::bare(route))
+                .await?;
+            Response::parse_response_body(bytes.as_slice())
+        }
 
+        pub(crate) async fn list_projects_response(
+            &self,
+            ctx: &Context,
+            req_wrapper: BareCloudRequestWrapper,
+        ) -> Result<Vec<u8>> {
+            let cloud_multiaddr = req_wrapper.multiaddr()?;
             let label = "list_projects";
             trace!(target: TARGET, "listing projects");
-
             let req_builder = Request::get("/v0");
 
             self.request_controller(
@@ -321,18 +338,29 @@ mod node {
             .await
         }
 
-        pub(crate) async fn get_project(
-            &mut self,
-            ctx: &mut Context,
-            dec: &mut Decoder<'_>,
+        pub async fn get_project(
+            &self,
+            ctx: &Context,
+            route: &MultiAddr,
+            project_id: &str,
+        ) -> Result<Project> {
+            Response::parse_response_body(
+                self.get_project_response(ctx, CloudRequestWrapper::bare(route), project_id)
+                    .await?
+                    .as_slice(),
+            )
+        }
+
+        pub(crate) async fn get_project_response(
+            &self,
+            ctx: &Context,
+            req_wrapper: BareCloudRequestWrapper,
             project_id: &str,
         ) -> Result<Vec<u8>> {
-            let req_wrapper: BareCloudRequestWrapper = dec.decode()?;
             let cloud_multiaddr = req_wrapper.multiaddr()?;
 
             let label = "get_project";
             trace!(target: TARGET, %project_id, "getting project");
-
             let req_builder = Request::get(format!("/v0/{project_id}"));
 
             self.request_controller(
@@ -347,14 +375,66 @@ mod node {
             .await
         }
 
-        pub(crate) async fn delete_project(
-            &mut self,
-            ctx: &mut Context,
-            dec: &mut Decoder<'_>,
+        pub async fn get_project_version(
+            &self,
+            ctx: &Context,
+            route: &MultiAddr,
+        ) -> Result<ProjectVersion> {
+            Response::parse_response_body(
+                self.get_project_version_response(ctx, CloudRequestWrapper::bare(route))
+                    .await?
+                    .as_slice(),
+            )
+        }
+
+        pub(crate) async fn get_project_version_response(
+            &self,
+            ctx: &Context,
+            req_wrapper: BareCloudRequestWrapper,
+        ) -> Result<Vec<u8>> {
+            let cloud_multiaddr = req_wrapper.multiaddr()?;
+
+            let label = "version_info";
+            trace!(target: TARGET, "getting project version");
+            let req_builder = Request::get("");
+
+            self.request_controller(
+                ctx,
+                label,
+                None,
+                &cloud_multiaddr,
+                "version_info",
+                req_builder,
+                None,
+            )
+            .await
+        }
+
+        pub async fn delete_project(
+            &self,
+            ctx: &Context,
+            route: &MultiAddr,
+            space_id: &str,
+            project_id: &str,
+        ) -> Result<()> {
+            let _ = self
+                .delete_project_response(
+                    ctx,
+                    CloudRequestWrapper::bare(route),
+                    space_id,
+                    project_id,
+                )
+                .await?;
+            Ok(())
+        }
+
+        pub(crate) async fn delete_project_response(
+            &self,
+            ctx: &Context,
+            req_wrapper: BareCloudRequestWrapper,
             space_id: &str,
             project_id: &str,
         ) -> Result<Vec<u8>> {
-            let req_wrapper: BareCloudRequestWrapper = dec.decode()?;
             let cloud_multiaddr = req_wrapper.multiaddr()?;
 
             let label = "delete_project";
@@ -372,6 +452,65 @@ mod node {
                 None,
             )
             .await
+        }
+    }
+
+    impl NodeManagerWorker {
+        pub(crate) async fn create_project_response(
+            &self,
+            ctx: &Context,
+            req_wrapper: CloudRequestWrapper<CreateProject>,
+            space_id: &str,
+        ) -> Result<Vec<u8>> {
+            let node_manager = self.get().read().await;
+            node_manager
+                .create_project_response(ctx, req_wrapper, space_id)
+                .await
+        }
+
+        pub(crate) async fn list_projects_response(
+            &self,
+            ctx: &Context,
+            req_wrapper: BareCloudRequestWrapper,
+        ) -> Result<Vec<u8>> {
+            let node_manager = self.get().read().await;
+            node_manager.list_projects_response(ctx, req_wrapper).await
+        }
+
+        pub(crate) async fn get_project_response(
+            &self,
+            ctx: &Context,
+            req_wrapper: BareCloudRequestWrapper,
+            project_id: &str,
+        ) -> Result<Vec<u8>> {
+            let node_manager = self.get().read().await;
+            node_manager
+                .get_project_response(ctx, req_wrapper, project_id)
+                .await
+        }
+
+        pub(crate) async fn get_project_version_response(
+            &self,
+            ctx: &Context,
+            req_wrapper: BareCloudRequestWrapper,
+        ) -> Result<Vec<u8>> {
+            let node_manager = self.get().read().await;
+            node_manager
+                .get_project_version_response(ctx, req_wrapper)
+                .await
+        }
+
+        pub(crate) async fn delete_project_response(
+            &self,
+            ctx: &Context,
+            req_wrapper: BareCloudRequestWrapper,
+            space_id: &str,
+            project_id: &str,
+        ) -> Result<Vec<u8>> {
+            let node_manager = self.get().read().await;
+            node_manager
+                .delete_project_response(ctx, req_wrapper, space_id, project_id)
+                .await
         }
     }
 }
@@ -411,15 +550,15 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
-    struct CPr(CreateProject<'static>);
+    struct CPr(CreateProject);
 
     impl Arbitrary for CPr {
         fn arbitrary(g: &mut Gen) -> Self {
             CPr(CreateProject {
                 #[cfg(feature = "tag")]
                 tag: Default::default(),
-                name: String::arbitrary(g).into(),
-                users: vec![String::arbitrary(g).into(), String::arbitrary(g).into()],
+                name: String::arbitrary(g),
+                users: vec![String::arbitrary(g), String::arbitrary(g)],
             })
         }
     }

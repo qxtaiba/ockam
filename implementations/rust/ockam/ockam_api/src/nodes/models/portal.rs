@@ -12,7 +12,7 @@ use ockam_core::{CowStr, Route};
 use ockam_identity::IdentityIdentifier;
 use ockam_multiaddr::MultiAddr;
 use serde::ser::SerializeStruct;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::route_to_multiaddr;
@@ -138,7 +138,7 @@ pub struct CreateOutlet {
     #[n(3)] pub alias: Option<String>,
     /// Allow the outlet to be reachable from the default secure channel, useful when we want to
     /// tighten the flow control
-    #[b(4)] pub reachable_from_default_secure_channel: bool,
+    #[n(4)] pub reachable_from_default_secure_channel: bool,
 }
 
 impl CreateOutlet {
@@ -222,11 +222,12 @@ impl InletStatus {
 }
 
 /// Response body when interacting with a portal endpoint
-#[derive(Clone, Debug, Decode, Encode, Serialize)]
+#[derive(Clone, Debug, Decode, Encode, Serialize, Deserialize)]
 #[rustfmt::skip]
 #[cbor(map)]
 pub struct OutletStatus {
     #[cfg(feature = "tag")]
+    #[serde(skip)]
     #[n(0)] tag: TypeTag<4012569>,
     #[n(1)] pub tcp_addr: String,
     #[n(2)] pub worker_addr: String,
@@ -276,7 +277,7 @@ impl OutletStatus {
 pub struct InletList {
     #[cfg(feature = "tag")]
     #[n(0)] tag: TypeTag<8401504>,
-    #[b(1)] pub list: Vec<InletStatus>
+    #[n(1)] pub list: Vec<InletStatus>
 }
 
 impl InletList {

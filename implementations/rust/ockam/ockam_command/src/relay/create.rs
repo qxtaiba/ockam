@@ -109,7 +109,7 @@ async fn rpc(ctx: Context, (opts, cmd): (CommandGlobalOpts, CreateCommand)) -> m
 
         *is_finished.lock().await = true;
 
-        rpc.parse_response::<ForwarderInfo>()
+        rpc.parse_response_body::<ForwarderInfo>()
     };
 
     let output_messages = vec![
@@ -162,7 +162,7 @@ async fn rpc(ctx: Context, (opts, cmd): (CommandGlobalOpts, CreateCommand)) -> m
     Ok(())
 }
 
-impl Output for ForwarderInfo<'_> {
+impl Output for ForwarderInfo {
     fn output(&self) -> Result<String> {
         let output = format!(
             r#"
